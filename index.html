@@ -2414,18 +2414,34 @@ async function performCloudSync(){
     });
     let {data:dbExams,error:examErr}=await supabaseClient.from('exams').select('id,exam_name,class_id,start_date,end_date,academic_year,instructions');
     if(examErr){ mirrorWarnings.push('exams lookup: '+examErr.message); dbExams=[]; }
-    const examFor=x=>{
-      const wantedId=String(x.supabaseExamId||x.examSupabaseId||'');
-      if(wantedId){const byId=(dbExams||[]).find(e=>e.id===wantedId);if(byId)return byId;}
-      const wanted=norm(x.examTitle||x.examName||x.exam_name||x.title||'');
-      const cl=classFor({className:x.className||x.class_name||x.classId||x.class_id});
-      const year=String(x.academicYear||x.academic_year||'');
-      return (dbExams||[]).find(e=>norm(e.exam_name)===wanted&&(!cl||e.class_id===cl.id)&&(!year||String(e.academic_year||'')===year));
+    const examFor=(x,parent=null)=>{
+      // Exam schedule entries may store the exam title/class on their parent
+      // examGroupId record. Resolve using both the subject row and that parent.
+      const pick=(...values)=>values.find(v=>v!==undefined&&v!==null&&String(v).trim()!=='');
+      const wantedId=String(pick(x.supabaseExamId,x.examSupabaseId,parent?.supabaseExamId,parent?.examSupabaseId,'')||'');
+      if(wantedId){const byId=(dbExams||[]).find(e=>String(e.id)===wantedId);if(byId)return byId;}
+      const wanted=norm(pick(x.examTitle,x.examName,x.exam_name,x.title,parent?.examTitle,parent?.examName,parent?.exam_name,parent?.title,''));
+      const classValue=pick(x.className,x.class_name,x.classId,x.class_id,parent?.className,parent?.class_name,parent?.classId,parent?.class_id,'');
+      const cl=classFor({className:classValue});
+      const year=String(pick(x.academicYear,x.academic_year,parent?.academicYear,parent?.academic_year,'')||'');
+      const matches=(dbExams||[]).filter(e=>norm(e.exam_name)===wanted&&(!cl||e.class_id===cl.id)&&(!year||String(e.academic_year||'')===year));
+      if(matches.length===1)return matches[0];
+      // If the legacy row omitted class/year, use the exam name only when unique.
+      const nameMatches=(dbExams||[]).filter(e=>norm(e.exam_name)===wanted);
+      return !cl&&!year&&nameMatches.length===1?nameMatches[0]:null;
     };
     // Save each subject schedule as a normalized row, linked to its parent exam.
     const subjectSyncRows=(state.exams||[]).map(x=>({source:x,group:String(x.examGroupId||x._id||'')}));
-    await syncRows('exam_subjects',subjectSyncRows,row=>['exam_id','subject_name'],row=>{
-      const x=row.source, ex=examFor(x), subject=String(x.subject||'').trim();
+    const validSubjectSyncRows=subjectSyncRows.filter(row=>{
+      const parent=examGroups.get(row.group)||null;
+      return !!examFor(row.source,parent) && !!String(row.source.subject||'').trim();
+    });
+    if(validSubjectSyncRows.length<subjectSyncRows.length){
+      console.warn('exam_subjects: skipped rows without a matching parent exam or subject',
+        subjectSyncRows.length-validSubjectSyncRows.length);
+    }
+    await syncRows('exam_subjects',validSubjectSyncRows,['exam_id','subject_name'],row=>{
+      const x=row.source, parent=examGroups.get(row.group)||null, ex=examFor(x,parent), subject=String(x.subject||'').trim();
       if(!ex||!subject)return null;
       const rawTime=String(x.time||'').trim();
       const times=rawTime.match(/(\d{1,2}:\d{2})\s*(?:-|–|to)\s*(\d{1,2}:\d{2})/i);
